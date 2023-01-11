@@ -1,0 +1,677 @@
+---
+title: "Arandjelovic_et_al_2022"
+author: "Dylan Sheerin"
+date: '2022-07-07'
+output: html_document
+---
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+setwd("/Users/sheerin.d/Library/CloudStorage/OneDrive-wehi.edu.au/2022/Marcel_HIV/Results")
+library(biomaRt)
+library(limma)
+library(edgeR)
+library(ggplot2)
+```
+
+```{r annotations, include=FALSE}
+#prepare gene annotations
+#define what mart and dataset to use
+human <- useEnsembl(biomart = "ensembl", dataset = "hsapiens_gene_ensembl", mirror = "uswest")
+ensembl_dataset = useDataset("hsapiens_gene_ensembl", mart = human)
+genome <- listDatasets(ensembl_dataset)[(listDatasets(ensembl_dataset)=="hsapiens_gene_ensembl"),]$version
+attributes = listAttributes(ensembl_dataset)
+ensembl = getBM(attributes = c("ensembl_gene_id","external_gene_name","entrezgene_id","transcript_length","gene_biotype","percentage_gene_gc_content","chromosome_name","start_position","end_position"),
+                mart = ensembl_dataset)
+ensembl = dplyr::rename(ensembl, gene_id = ensembl_gene_id, gene_name = external_gene_name, entrez = entrezgene_id, length = transcript_length, biotype = gene_biotype, GC_content = percentage_gene_gc_content, Chr = chromosome_name, GeneStart = start_position, GeneEnd = end_position)
+```
+
+```{r load data}
+#load featureCounts count matrix
+fc <- read.table("/Users/sheerin.d/Library/CloudStorage/OneDrive-wehi.edu.au/2022/Marcel_HIV/Data/fc_counts.txt", row.names = 1)
+colnames(fc) <- gsub("X.stornext.Home.data.users.allstaff.sheerin.d.marcel_HIV.concatenated.", "", colnames(fc))
+colnames(fc) <- gsub("^.{0,3}", "", colnames(fc))
+colnames(fc) <- gsub("_R1.fastq.gz.subread.BAM", "", colnames(fc))
+colnames(fc) = substr(colnames(fc),1,nchar(colnames(fc))-4)
+colnames(fc)
+
+#load metadata
+meta = read.csv("/Users/sheerin.d/Library/CloudStorage/OneDrive-wehi.edu.au/2022/Marcel_HIV/Data/metadata.csv", row.names = 8)[,c(2:7)]
+all(rownames(meta) %in% colnames(fc))
+#TRUE
+fc <- fc[,rownames(meta)]
+all(rownames(meta) == colnames(fc))
+#TRUE
+```
+
+```{r edgeR object}
+#create DGEList object
+dge <- DGEList(fc, group = meta$treatment)
+dim(dge)
+#60664    54
+
+#barplot of library sizes post-bioinformatic globin-depletion
+par(mfrow = c(1,1))
+barplot(dge$samples$lib.size, names.arg = rownames(dge$samples), las = 2, cex.names = 0.5)
+abline(h=3e07, col="blue")
+title("Barplot of library sizes")
+
+#add metadata
+dge$samples$Patient <- meta$patient
+dge$samples$Exp <- meta$Exp
+
+#add gene annotation
+gene_id <- rownames(dge)
+my_genes <- ensembl[match(gene_id, ensembl$gene_id),]
+dge$genes <- my_genes
+
+#restrict to protein-coding and long non-coding biotypes
+dge <- dge[grep("protein_coding|lncRNA",dge$genes$biotype),]
+dim(dge)
+#36816    54
+```
+
+```{r quality control}
+#prepare transformed count matrices
+cpm <- cpm(dge)
+lcpm <- cpm(dge, log=TRUE)
+
+#filter out lowly expressed genes
+keep <- filterByExpr(dge, group = dge$samples$group)
+summary(keep)
+#   Mode   FALSE    TRUE 
+#logical   17776   19040
+dge <- dge[keep, , keep.lib.sizes = F]
+dim(dge)
+#19040    54
+
+#compare pre- versus post-filtered data
+library(RColorBrewer)
+L <- mean(dge$samples$lib.size) * 1e-6
+M <- median(dge$samples$lib.size) * 1e-6
+c(L, M)
+lcpm.cutoff <- log2(10/M + 2/L)
+nsamples <- ncol(dge)
+col <- brewer.pal(nsamples, "Paired")
+```
+
+```{r filterByExpr plot, echo=FALSE}
+par(mfrow=c(1,2))
+plot(density(lcpm[,1]), col=col[1], lwd=2, ylim=c(0,0.26), las=2, main="", xlab="")
+title(main="A. Raw data", xlab="Log-cpm")
+abline(v=lcpm.cutoff, lty=3)
+for (i in 2:nsamples){
+den <- density(lcpm[,i])
+lines(den$x, den$y, col=col[i], lwd=2)
+}
+legend("topright", colnames(dge), text.col=col, bty="n")
+lcpm <- cpm(dge, log=TRUE)
+plot(density(lcpm[,1]), col=col[1], lwd=2, ylim=c(0,0.26), las=2, main="", xlab="")
+title(main="B. Filtered data", xlab="Log-cpm")
+abline(v=lcpm.cutoff, lty=3)
+for (i in 2:nsamples){
+den <- density(lcpm[,i])
+lines(den$x, den$y, col=col[i], lwd=2)
+}
+legend("topright", colnames(dge), text.col=col, bty="n")
+```
+
+```{r quality control cont.}
+#normalisation
+dge <- calcNormFactors(dge, method = "TMMwsp")
+dge$samples$norm.factors
+
+#compare pre- versus post-normalisation
+x2 <- dge
+x2$samples$norm.factors <- 1
+x2$counts[,1] <- ceiling(x2$counts[,1]*0.05)
+x2$counts[,2] <- x2$counts[,2]*5
+```
+
+```{r normalisation plot, echo=FALSE}
+par(mfrow=c(1,2))
+lcpm <- cpm(x2, log=TRUE)
+boxplot(lcpm, las=2, col=col, main="")
+title(main="A. Example: Unnormalised data",ylab="Log-cpm")
+x2 <- calcNormFactors(x2)  
+x2$samples$norm.factors
+lcpm <- cpm(x2, log=TRUE)
+boxplot(lcpm, las=2, col=col, main="")
+title(main="B. Example: Normalised data",ylab="Log-cpm")
+```
+
+```{r PCA}
+library(factoextra)
+lcpm_grp <- lcpm
+colnames(lcpm_grp) <- make.unique(as.character(dge$samples$group))
+pca <- prcomp(t(lcpm_grp), scale = T)
+colors <- as.factor(dge$samples$Patient)
+factoextra::fviz_pca_ind(pca,
+             col.ind = colors,
+             palette = "Set1",
+             repel = TRUE,    # Avoid text overlapping
+             title = "PCA plot (Dimensions 1 & 2)"
+)
+factoextra::fviz_pca_ind(pca,
+                         axes = c(3,4),
+             col.ind = colors,
+             palette = "Set1",
+             repel = TRUE,    # Avoid text overlapping
+             title = "PCA plot (Dimensions 3 & 4)"
+)
+factoextra::fviz_pca_ind(pca,
+                         axes = c(5,6),
+             col.ind = colors,
+             palette = "Set1",
+             repel = TRUE,    # Avoid text overlapping
+             title = "PCA plot (Dimensions 3 & 4)"
+)
+
+#check dimension 1 again after removing PMA group
+lcpm_grp2 <- lcpm_grp[,-grep("PMA",colnames(lcpm_grp))]
+pca2 <- prcomp(t(lcpm_grp2), scale = T)
+colors2 <- as.factor(dge[,-grep("PMA",dge$samples$group)]$samples$Patient)
+factoextra::fviz_pca_ind(pca2,
+             col.ind = colors2,
+             palette = "Set1",
+             repel = TRUE,    # Avoid text overlapping
+             title = "PCA plot (Dimensions 1 & 2)"
+)
+
+library("FactoMineR")
+lcpm_grp2 <- lcpm_grp[,c(1:6,19:24,43:48)]
+gene_id <- rownames(lcpm_grp2)
+genes <- ensembl[match(gene_id, ensembl$gene_id),]
+genes <- genes[!duplicated(genes$gene_name),]
+lcpm_grp2 <- lcpm_grp2[rownames(lcpm_grp2) %in% genes$gene_id,]
+genes <- genes[genes$gene_id %in% rownames(lcpm_grp2),]
+rownames(lcpm_grp2) <- genes$gene_name
+lcpm_grp2 <- lcpm_grp2[-5,]
+groups <- dge[,grep("DMSO|100nM VNX|100nM VNX + MCLi",dge$samples$group)]$samples$group
+
+res.pca <- prcomp(t(lcpm_grp2), scale = T)
+fviz_pca_ind(res.pca)
+pca <- fviz_pca_ind(res.pca, axes = c(1,2), label = "none", habillage = groups, addEllipses = T, ellipse.level = 0.5)
+print(pca)
+pca2 <- fviz_pca_ind(res.pca, axes = c(2,3), label = "none", habillage = groups, addEllipses = T, ellipse.level = 0.5)
+print(pca2)
+pca3 <- fviz_pca_ind(res.pca, axes = c(3,4), label = "none", habillage = groups, addEllipses = T, ellipse.level = 0.5)
+print(pca3)
+
+#plot contributions
+var <- get_pca_var(res.pca)
+res.km <- kmeans(var$coord, centers = 10, nstart = 25)
+grp <- as.factor(res.km$cluster)
+pca.contrib <- fviz_pca_var(res.pca, select.var = list(contrib = 20), title = "Variables", repel = T, axes = c(1,2), col.var = "contrib",
+              gradient.cols = c("#00AFBB", "#E7B800","#FC4E07"), legend.title = "Contribution (%)",
+                             ggtheme = theme_void())
+pca.contrib
+pca.contrib2 <- fviz_pca_var(res.pca, select.var = list(contrib = 20), title = "Variables", repel = T, axes = c(2,3), col.var = "contrib",
+             gradient.cols = c("#00AFBB", "#E7B800","#FC4E07"), legend.title = "Contribution (%)",
+             ggtheme = theme_void())
+pca.contrib2
+pca.contrib3 <- fviz_pca_var(res.pca, select.var = list(contrib = 20), title = "Variables", repel = T, axes = c(3,4), col.var = "contrib",
+             gradient.cols = c("#00AFBB", "#E7B800","#FC4E07"), legend.title = "Contribution (%)",
+             ggtheme = theme_void())
+pca.contrib3
+
+library(corrplot)
+corrplot(var$contrib[1:50,1:4], is.corr=F)
+
+library(cowplot)
+cowplot <- ggdraw(pca) + draw_plot(pca.contrib, x = 0.28, y = 0.3, scale = 0.4)
+cowplot2 <- ggdraw(pca2) + draw_plot(pca.contrib2, x = 0.28, y = 0.3, scale = 0.4)
+cowplot3 <- ggdraw(pca3) + draw_plot(pca.contrib3, x = 0.28, y = 0.3, scale = 0.4)
+```
+
+```{r sample correlation heatmap}
+corr = cor(cpm, method = "pearson")
+matrix = as.matrix(corr)
+
+library(ComplexHeatmap)
+set.seed(20)
+mypalette <- brewer.pal(11,"RdYlBu")
+morecols <- colorRampPalette(mypalette)
+ann <- data.frame(dge$samples[,c(1,4)])
+colours <- list("Patient"=c("PRA006"="cyan","ICB-2006"="greenyellow","PRA003"="turquoise","ICB-3147"="green","PRA011"="blue","ICB-2013"="purple"),
+                "group"=c("DMSO"="black","5nM VNX"="yellow","10nM VNX"="orange","100nM VNX"="red","10nM MCLi"="brown","5nM VNX + MCLi"="gold","10nM VNX + MCLi"="darkorange","100nM VNX + MCLi"="darkred","PMA/PHA"="pink"))
+colAnn <- HeatmapAnnotation(df=ann, which="col", col=colours, annotation_width=unit(c(1, 4), "cm"), gap=unit(1, "mm"))
+colAnn1 <- HeatmapAnnotation(df=ann, which="row", col=colours, annotation_width=unit(c(1, 4), "cm"), gap=unit(1, "mm"))
+
+ht_list = 
+  Heatmap(matrix, name = "Correlation",
+          row_title = "",
+          row_title_gp = gpar(fontsize = 8),
+          col = rev(morecols(50)),
+          width = unit(7, "cm"),
+          height = unit(7, "cm"),
+          top_annotation = colAnn,
+          left_annotation = colAnn1,
+          cluster_rows =T,
+          show_row_names = T,
+          row_names_side = "left",
+          row_names_gp = gpar(fontsize = 8),
+          cluster_columns =T,
+          column_names_side = "top",
+          column_names_gp = gpar(fontsize = 8),  
+          column_title = "", 
+          column_title_gp = gpar(fontsize = 8))
+
+set.seed(20)
+clus = draw(ht_list)
+```
+
+```{r expression heatmap}
+#look at clustering based on most variable genes
+var_genes <- apply(lcpm, 1, var)
+select_var <- names(sort(var_genes, decreasing=TRUE))[1:105]
+#remove gene ids with no corresponding gene name
+select_var <- select_var[-c(9,17,52,62,83)]
+highly_variable_lcpm <- lcpm[select_var,]
+hvl_genes <- ensembl[match(rownames(highly_variable_lcpm), ensembl$gene_id),]
+rownames(highly_variable_lcpm) <- hvl_genes$gene_name
+library(gplots)
+col.patient <- factor(dge$samples$Patient)
+levels(col.patient) <-  brewer.pal(nlevels(col.patient), "Set2")
+col.patient <- as.character(col.patient)
+heatmap.2(highly_variable_lcpm, col=rev(morecols(50)), trace="none", main="Top 100 most variable genes across samples", ColSideColors=col.patient,scale="row", srtCol=45)
+
+#repeat after removing PMA group and just look at top 20 genes
+var_genes2 <- apply(lcpm_grp2, 1, var)
+select_var2 <- names(sort(var_genes2, decreasing=TRUE))[1:100]
+#remove gene ids with no corresponding gene name
+select_var2 <- select_var2[-c(9,17,52,62,83)]
+highly_variable_lcpm2 <- lcpm_grp2[select_var2,]
+hvl_genes2 <- ensembl[match(rownames(highly_variable_lcpm2), ensembl$gene_id),]
+rownames(highly_variable_lcpm2) <- hvl_genes2$gene_name
+library(gplots)
+col.patient2 <- factor(dge[,-grep("PMA",dge$samples$group)]$samples$Patient)
+levels(col.patient2) <-  brewer.pal(nlevels(col.patient2), "Set2")
+col.patient2 <- as.character(col.patient2)
+heatmap.2(highly_variable_lcpm2, col=rev(morecols(50)), trace="none", main="Top 100 most variable genes across samples", ColSideColors=col.patient2,scale="row", srtCol=45)
+```
+
+```{r DGE analysis}
+#create design matrix
+dge$samples$group <- factor(dge$samples$group)
+dge$samples$group <- relevel(dge$samples$group, ref = "DMSO")
+design <- model.matrix(~dge$samples$Patient + dge$samples$group)
+colnames(design) <- c("(Intercept)","ICB_2013","ICB_3147","PRA003","PRA006","PRA011","VNX_100nM","VNX_100nM_MCLi","MCLi_10nM","VNX_10nM","VNX_10nM_MCLi","VNX_5nM","VNX_5nM_MCLi","PMA_PHA")
+rownames(design) <- colnames(dge)
+
+v <- voom(dge, design)
+vfit <- lmFit(v, design)
+efit <- eBayes(vfit)
+
+#estimate dispersion
+dge <- estimateDisp(dge, design = design)
+
+#likelihood ratio test
+fit <- glmQLFit(dge, design)
+
+#VNX
+VNX_5nM <- glmLRT(fit, coef = "VNX_5nM")
+summary(decideTests(VNX_5nM))
+VNX_10nM <- glmLRT(fit, coef = "VNX_10nM")
+summary(decideTests(VNX_10nM))
+VNX_100nM <- glmLRT(fit, coef = "VNX_100nM")
+summary(decideTests(VNX_100nM))
+#MCLi
+MCLi_10nM <- glmLRT(fit, coef = "MCLi_10nM")
+summary(decideTests(MCLi_10nM))
+#VNX + MCLi
+VNX_5nM_MCLi <- glmLRT(fit, coef = "VNX_5nM_MCLi")
+summary(decideTests(VNX_5nM_MCLi))
+VNX_10nM_MCLi <- glmLRT(fit, coef = "VNX_10nM_MCLi")
+summary(decideTests(VNX_10nM_MCLi))
+VNX_100nM_MCLi <- glmLRT(fit, coef = "VNX_100nM_MCLi")
+summary(decideTests(VNX_100nM_MCLi))
+#PMA
+PMA_PHA <- glmLRT(fit, coef = "PMA_PHA")
+summary(decideTests(PMA_PHA))
+```
+
+```{r DGE results}
+#output results tables
+#set DEG thresholds
+fdr.cutoff <- 0.05
+lfc.cutoff <- 0.58
+
+#output results tables
+full_res <- function(x){
+  res <- topTags(x, n=nrow(x$table), adjust.method = "BH", sort.by = "PValue")
+  res <- as.data.frame(res)
+  gene_id <- rownames(res)
+  gene_id <- ensembl[match(gene_id, ensembl$gene_id),]
+  gene_id <- gene_id[!duplicated(gene_id$gene_name),]
+  res <- res[rownames(res) %in% gene_id$gene_id,]
+  gene_id <- gene_id[gene_id$gene_id %in% rownames(res),]
+  rownames(res) <- gene_id$gene_name
+  res$gene_id <- gene_id$gene_id
+  res$transcript_id <- gene_id$transcript_id
+  res$entrez <- gene_id$entrez
+  res$gene_biotype <- gene_id$gene_biotype
+  res$chromosome <- gene_id$chromosome
+  res
+}
+
+sig_res <- function(x){
+  res <- topTags(x, n=nrow(x$table), adjust.method = "BH", sort.by = "PValue")
+  res <- as.data.frame(res)
+  sig.res <- res[res$FDR < fdr.cutoff,]
+  sig.res <- sig.res[abs(sig.res$logFC) > lfc.cutoff,]
+  gene_id <- rownames(sig.res)
+  gene_id <- ensembl[match(gene_id, ensembl$gene_id),]
+  gene_id <- gene_id[!duplicated(gene_id$gene_name),]
+  sig.res <- sig.res[rownames(sig.res) %in% gene_id$gene_id,]
+  gene_id <- gene_id[gene_id$gene_id %in% rownames(sig.res),]
+  rownames(sig.res) <- gene_id$gene_name
+  sig.res$gene_id <- gene_id$gene_id
+  sig.res$transcript_id <- gene_id$transcript_id
+  sig.res$entrez <- gene_id$entrez
+  sig.res$gene_biotype <- gene_id$gene_biotype
+  sig.res$chromosome <- gene_id$chromosome
+  sig.res
+}
+
+#VNX
+full_res_VNX_5nM <- full_res(VNX_5nM)
+sig_res_VNX_5nM <- sig_res(VNX_5nM)
+write.csv(sig_res_VNX_5nM, "sig_VNX_5nM.csv")
+full_res_VNX_10nM <- full_res(VNX_10nM)
+sig_res_VNX_10nM <- sig_res(VNX_10nM)
+write.csv(sig_res_VNX_10nM, "sig_VNX_10nM.csv")
+full_res_VNX_100nM <- full_res(VNX_100nM)
+sig_res_VNX_100nM <- sig_res(VNX_100nM)
+write.csv(sig_res_VNX_100nM, "sig_VNX_100nM.csv")
+#MCLi
+full_res_MCLi_10nM <- full_res(MCLi_10nM)
+sig_res_MCLi_10nM <- sig_res(MCLi_10nM)
+write.csv(sig_res_MCLi_10nM, "sig_MCLi_10nM.csv")
+#VNX + MCLi
+full_res_VNX_5nM_MCLi <- full_res(VNX_5nM_MCLi)
+sig_res_VNX_5nM_MCLi <- sig_res(VNX_5nM_MCLi)
+write.csv(sig_res_VNX_5nM_MCLi, "sig_VNX_5nM_MCLi.csv")
+full_res_VNX_10nM_MCLi <- full_res(VNX_10nM_MCLi)
+sig_res_VNX_10nM_MCLi <- sig_res(VNX_10nM_MCLi)
+write.csv(sig_res_VNX_10nM_MCLi, "sig_VNX_10nM_MCLi.csv")
+full_res_VNX_100nM_MCLi <- full_res(VNX_100nM_MCLi)
+sig_res_VNX_100nM_MCLi <- sig_res(VNX_100nM_MCLi)
+write.csv(sig_res_VNX_100nM_MCLi, "sig_VNX_100nM_MCLicsv")
+#PMA
+full_res_PMA_PHA <- full_res(PMA_PHA)
+sig_res_PMA_PHA <- sig_res(PMA_PHA)
+write.csv(sig_res_PMA_PHA, "sig_PMA_PHA.csv")
+```
+
+```{r post-DGE heatmap}
+library(gplots)
+VNX_100nM.topgenes <- sig_res_VNX_100nM$gene_name[1:101]
+VNX_100nM.topgenes <- VNX_100nM.topgenes[-76]
+mycol <- colorpanel(1000,"blue","white","red")
+lcpm <- cpm(dge, log=TRUE)
+gene_id <- rownames(lcpm)
+genes <- ensembl[match(gene_id, ensembl$gene_id),]
+genes <- genes[!duplicated(genes$gene_name),]
+lcpm <- lcpm[rownames(lcpm) %in% genes$gene_id,]
+genes <- genes[genes$gene_id %in% rownames(lcpm),]
+rownames(lcpm) <- genes$gene_name
+lcpm <- lcpm[-5,]
+s1 <- colnames(lcpm)[c(1:6,19:24)]
+heatmap.2(lcpm[VNX_100nM.topgenes,s1], scale="row",
+   labRow=VNX_100nM.topgenes, labCol=dge[,s1]$samples$group,
+   col=mycol, trace="none", density.info="none", 
+   margin=c(8,6), lhei=c(2,10), dendrogram="column")
+```
+```{r BCL2L11}
+bcl_col <- c("white","lightpink","indianred2","red")
+cpm_y <- cpm(dge)
+gene_id <- rownames(cpm_y)
+genes <- ensembl[match(gene_id, ensembl$gene_id),]
+genes <- genes[!duplicated(genes$gene_name),]
+cpm_y <- cpm_y[rownames(cpm_y) %in% genes$gene_id,]
+genes <- genes[genes$gene_id %in% rownames(cpm_y),]
+rownames(cpm_y) <- genes$gene_name
+pro_surv <- (as.data.frame(cpm_y[c("BCL2","MCL1","BCL2L1","BCL2A1","BCL2L2"),]))
+pro_surv <- pro_surv[,c(1:24)]
+colnames(pro_surv) <- dge$samples$group[c(1:24)]
+pro_surv <- reshape2::melt(t(pro_surv))
+colnames(pro_surv) <- c("Group","Gene","Expression")
+ggplot(pro_surv, aes(x=Group, y=Expression)) +
+  geom_boxplot(aes(fill=Group), alpha=1, outlier.shape = NA) +
+  scale_fill_manual(values = bcl_col) +
+  geom_jitter(position=position_jitter(0.2)) +
+  labs(title = "Expression of pro-survival Bcl-2 family genes by group") +
+  ylab("Normalized expression value") +
+  facet_wrap(~Gene, scales = "free_y") +
+  theme_bw() +
+  theme(axis.text.x = element_blank(), axis.ticks.x = element_blank(), axis.text.y = element_text(colour = "black", size = 12), axis.title.y = element_text(size = 18, face = "bold"), axis.title.x = element_blank(), legend.position = "right", legend.text = element_text(size = 16), legend.title = element_text(face = "bold", size = 16), strip.text.x = element_text(size = 14), plot.title = element_text(size=20, face = "bold"))
+
+pro_death <- (as.data.frame(cpm_y[c("BAX","BAK1","BID","BAD","PMAIP1","BBC3","BMF","BCL2L11"),]))
+pro_death <- pro_death[,c(1:24)]
+colnames(pro_death) <- dge$samples$group[c(1:24)]
+pro_death <- reshape2::melt(t(pro_death))
+colnames(pro_death) <- c("Group","Gene","Expression")
+ggplot(pro_death, aes(x=Group, y=Expression)) +
+  geom_boxplot(aes(fill=Group), alpha=1, outlier.shape = NA) +
+  scale_fill_manual(values = bcl_col) +
+  geom_jitter(position=position_jitter(0.2)) +
+  labs(title = "Expression of pro-survival Bcl-2 family genes by group") +
+  ylab("Normalized expression value") +
+  facet_wrap(~Gene, scales = "free_y", ncol = 2) +
+  theme_bw() +
+  theme(axis.text.x = element_blank(), axis.ticks.x = element_blank(), axis.text.y = element_text(colour = "black", size = 12), axis.title.y = element_text(size = 18, face = "bold"), axis.title.x = element_blank(), legend.position = "right", legend.text = element_text(size = 16), legend.title = element_text(face = "bold", size = 16), strip.text.x = element_text(size = 14), plot.title = element_text(size=20, face = "bold"))
+
+bcl_fam <- rbind(pro_death, pro_surv)
+ggplot(bcl_fam, aes(x=Group, y=Expression)) +
+  geom_boxplot(aes(fill=Group), alpha=1, outlier.shape = NA) +
+  scale_fill_manual(values = bcl_col) +
+  geom_jitter(position=position_jitter(0.2)) +
+  labs(title = "Expression of Bcl-2 family genes by group") +
+  ylab("Normalized expression value") +
+  facet_wrap(~Gene, scales = "free_y", nrow = 7, ncol = 2) +
+  theme_bw() +
+  theme(axis.text.x = element_blank(), axis.ticks.x = element_blank(), axis.text.y = element_text(colour = "black", size = 12), axis.title.y = element_text(size = 18, face = "bold"), axis.title.x = element_blank(), legend.position = "bottom", legend.text = element_text(size = 16), legend.title = element_text(face = "bold", size = 16), strip.text.x = element_text(size = 14), plot.title = element_text(size=20, face = "bold"))
+
+full_res_VNX_5nM[c("BAX","BAK1","BID","BAD","PMAIP1","BBC3","BMF","BCL2L11","BCL2","MCL1","BCL2L1","BCL2A1","BCL2L2"),]
+full_res_VNX_10nM[c("BAX","BAK1","BID","BAD","PMAIP1","BBC3","BMF","BCL2L11","BCL2","MCL1","BCL2L1","BCL2A1","BCL2L2"),]
+full_res_VNX_100nM[c("BAX","BAK1","BID","BAD","PMAIP1","BBC3","BMF","BCL2L11","BCL2","MCL1","BCL2L1","BCL2A1","BCL2L2"),]
+
+bim <- t(as.data.frame(cpm_y[c("BCL2L11"),]))
+colnames(bim) <- dge$samples$group
+rownames(bim) <- "BCL2L11"
+bim <- reshape2::melt((bim))
+colnames(bim) <- c("Gene","Group","Expression")
+bim <- bim[c(1:24),]
+ggplot(bim, aes(x=Group, y=Expression)) +
+  geom_boxplot(aes(fill=Group), alpha=1, outlier.shape = NA) +
+  scale_fill_manual(values = bcl_col) +
+  geom_jitter(position=position_jitter(0.2)) +
+  labs(title = "BIM (BCL2L11) expression by group") +
+  ylab("Normalized expression value") +
+  theme_bw() +
+  theme(axis.text.x = element_blank(), axis.ticks.x = element_blank(), axis.text.y = element_text(colour = "black", size = 12), axis.title.y = element_text(size = 18, face = "bold"), axis.title.x = element_blank(), legend.position = "bottom", legend.text = element_text(size = 16), legend.title = element_text(face = "bold", size = 16), strip.text.x = element_text(size = 14), plot.title = element_text(size=20, face = "bold"))
+```
+
+
+```{r venn diagrams}
+library(gplots)
+#VNX
+VNX_venn <- venn(list(rownames(sig_res_VNX_5nM), rownames(sig_res_VNX_10nM), rownames(sig_res_VNX_100nM)))
+#VNX combo
+VNX_combo_venn <- venn(list(rownames(sig_res_VNX_5nM_MCLi), rownames(sig_res_VNX_10nM_MCLi), rownames(sig_res_VNX_100nM_MCLi)))
+```
+
+```{r heatmap 2}
+library(gplots)
+lcpm <- cpm(dge, log=TRUE)
+gene_id <- rownames(lcpm)
+genes <- ensembl[match(gene_id, ensembl$gene_id),]
+genes <- genes[!duplicated(genes$gene_name),]
+lcpm <- lcpm[rownames(lcpm) %in% genes$gene_id,]
+genes <- genes[genes$gene_id %in% rownames(lcpm),]
+rownames(lcpm) <- genes$gene_name
+lcpm <- lcpm[-5,]
+topgenes1 <- rownames(sig_res_VNX_100nM)[1:50]
+i1 <- which(rownames(lcpm) %in% topgenes1)
+s1 <- colnames(lcpm)[c(1:6,19:24)]
+mycol <- colorpanel(1000,"blue","white","red")
+heatmap.2(lcpm[i1,s1], scale="row",
+   labRow=rownames(lcpm)[i1], labCol=dge$samples$group[c(1:6,19:24)], 
+   col=mycol, trace="none", density.info="none", dendrogram="column", srtCol=45, cexCol = 1, cexRow = 0.4)
+topgenes2 <- rownames(sig_res_VNX_100nM_MCLi)[c(1:19,21:51)]
+i2 <- which(rownames(lcpm) %in% topgenes2)
+s2 <- colnames(lcpm)[c(1:6,43:48)]
+mycol <- colorpanel(1000,"blue","white","red")
+heatmap.2(lcpm[i2,s2], scale="row",
+   labRow=rownames(lcpm)[i2], labCol=dge$samples$group[c(1:6,43:48)], 
+   col=mycol, trace="none", density.info="none", dendrogram="column", srtCol=45, cexCol = 0.6, cexRow = 0.4)
+
+
+lcpm[i2,s2]
+
+p_con <- factor(paste0(dge$samples$Patient, "_", dge$samples$group))
+p_con <- p_con[c(1:6,19:24,43:48)]
+
+group <- dge$samples$group
+group <- relevel(group, ref = "100nM VNX")
+design <- model.matrix(~0+p_con + group)
+design <- design[,-c(3:7,9,12:16,18,21:25,27,30:34,36,39:43,45,48:52,54:56)]
+rownames(design) <- colnames(dge)
+colnames(design) <- c("ICB_2006_100nM_VNX","ICB_2006_100nM_VNX_MCLi","ICB_2006_DMSO","ICB_2013_100nM_VNX","ICB_2013_100nM_VNX_MCLi","ICB_2013_DMSO","ICB_3147_100nM_VNX","ICB_3147_100nM_VNX_MCLi","ICB_3147_DMSO","PRA003_100nM_VNX","PRA003_100nM_VNX_MCLi","PRA003_DMSO","PRA006_100nM_VNX","PRA006_100nM_VNX_MCLi","PRA006_DMSO","PRA011_100nM_VNX","PRA011_100nM_VNX_MCLi","PRA011_DMSO","MCLi_10nM","VNX_10nM","VNX_MCLi_10nM","VNX_5nM","VNX_MCLi_5nM","PMA_PHA")
+contrasts <- makeContrasts(ICB_2006_100nM_VNX = ICB_2006_100nM_VNX - ICB_2006_DMSO, ICB_2006_100nM_VNX_MCLi = ICB_2006_100nM_VNX_MCLi - ICB_2006_DMSO, ICB_2013_100nM_VNX = ICB_2013_100nM_VNX - ICB_2013_DMSO, ICB_2013_100nM_VNX_MCLi = ICB_2013_100nM_VNX_MCLi - ICB_2013_DMSO, ICB_3147_100nM_VNX = ICB_3147_100nM_VNX - ICB_3147_DMSO, ICB_3147_100nM_VNX_MCLi = ICB_3147_100nM_VNX_MCLi - ICB_3147_DMSO, PRA003_100nM_VNX = PRA003_100nM_VNX - PRA003_DMSO, PRA003_100nM_VNX_MCLi = PRA003_100nM_VNX_MCLi - PRA003_DMSO, PRA006_100nM_VNX = PRA006_100nM_VNX - PRA006_DMSO, PRA006_100nM_VNX_MCLi = PRA006_100nM_VNX_MCLi - PRA006_DMSO, PRA011_100nM_VNX = PRA011_100nM_VNX - PRA011_DMSO, PRA011_100nM_VNX_MCLi = PRA011_100nM_VNX_MCLi - PRA011_DMSO, levels = colnames(design))
+
+v <- voom(dge, design)
+vfit <- lmFit(v, design)
+vfit <- contrasts.fit(vfit, contrasts = contrasts)
+efit <- eBayes(vfit)
+
+gi2gn <- function(x){
+  gene_id <- rownames(x)
+  genes <- ensembl[match(gene_id, ensembl$gene_id),]
+  genes <- genes[!duplicated(genes$gene_name),]
+  genes <- genes[!is.na(genes$gene_name),]
+  x <- x[rownames(x) %in% genes$gene_id,]
+  genes <- genes[genes$gene_id %in% rownames(x),]
+  rownames(x) <- genes$gene_name
+  x
+}
+ICB_2006_100nM_VNX <- topTable(efit, coef = "ICB_2006_100nM_VNX", n = Inf)
+ICB_2006_100nM_VNX <- gi2gn(ICB_2006_100nM_VNX)
+ICB_2006_100nM_VNX_MCLi <- topTable(efit, coef = "ICB_2006_100nM_VNX_MCLi", n = Inf)
+ICB_2006_100nM_VNX_MCLi <- gi2gn(ICB_2006_100nM_VNX_MCLi)
+ICB_2013_100nM_VNX <- topTable(efit, coef = "ICB_2013_100nM_VNX", n = Inf)
+ICB_2013_100nM_VNX <- gi2gn(ICB_2013_100nM_VNX)
+ICB_2013_100nM_VNX_MCLi <- topTable(efit, coef = "ICB_2013_100nM_VNX_MCLi", n = Inf)
+ICB_2013_100nM_VNX_MCLi <- gi2gn(ICB_2013_100nM_VNX_MCLi)
+ICB_3147_100nM_VNX <- topTable(efit, coef = "ICB_3147_100nM_VNX", n = Inf)
+ICB_3147_100nM_VNX <- gi2gn(ICB_3147_100nM_VNX)
+ICB_3147_100nM_VNX_MCLi <- topTable(efit, coef = "ICB_3147_100nM_VNX_MCLi", n = Inf)
+ICB_3147_100nM_VNX_MCLi <- gi2gn(ICB_3147_100nM_VNX_MCLi)
+PRA003_100nM_VNX <- topTable(efit, coef = "PRA003_100nM_VNX", n = Inf)
+PRA003_100nM_VNX <- gi2gn(PRA003_100nM_VNX)
+PRA003_100nM_VNX_MCLi <- topTable(efit, coef = "PRA003_100nM_VNX_MCLi", n = Inf)
+PRA003_100nM_VNX_MCLi <- gi2gn(PRA003_100nM_VNX_MCLi)
+PRA006_100nM_VNX <- topTable(efit, coef = "PRA006_100nM_VNX", n = Inf)
+PRA006_100nM_VNX <- gi2gn(PRA006_100nM_VNX)
+PRA006_100nM_VNX_MCLi <- topTable(efit, coef = "PRA006_100nM_VNX_MCLi", n = Inf)
+PRA006_100nM_VNX_MCLi <- gi2gn(PRA006_100nM_VNX_MCLi)
+PRA011_100nM_VNX <- topTable(efit, coef = "PRA011_100nM_VNX", n = Inf)
+PRA011_100nM_VNX <- gi2gn(PRA011_100nM_VNX)
+PRA011_100nM_VNX_MCLi <- topTable(efit, coef = "PRA011_100nM_VNX_MCLi", n = Inf)
+PRA011_100nM_VNX_MCLi <- gi2gn(PRA011_100nM_VNX_MCLi)
+
+lfc_values_100nM <- data.frame("ICB_2006" = ICB_2006_100nM_VNX[topgenes1,"logFC"],"ICB_2013" = ICB_2013_100nM_VNX[topgenes1,"logFC"],"ICB_3147" = ICB_3147_100nM_VNX[topgenes1,"logFC"],"PRA003" = PRA003_100nM_VNX[topgenes1,"logFC"],"PRA006" = PRA006_100nM_VNX[topgenes1,"logFC"],"PRA011" = PRA011_100nM_VNX[topgenes1,"logFC"])
+rownames(lfc_values_100nM) <- topgenes1
+lfc_values_100nM <- as.matrix(lfc_values_100nM)
+
+heatmap.2(lfc_values_100nM, scale="row",
+   labRow=rownames(lfc_values_100nM), labCol=colnames(lfc_values_100nM), 
+   col=mycol, trace="none", density.info="none", dendrogram="column", srtCol=45, cexCol = 0.8, cexRow = 0.4)
+
+lfc_values_100nM <- data.frame(ICB_2006_100nM_VNX[,c("gene_name","logFC")])
+lfc_values_100nM_1 <- data.frame("ICB_2006" = ICB_2006_100nM_VNX[rownames(lfc_values_100nM),"logFC"],"ICB_2013" = ICB_2013_100nM_VNX[rownames(lfc_values_100nM),"logFC"],"ICB_3147" = ICB_3147_100nM_VNX[rownames(lfc_values_100nM),"logFC"],"PRA003" = PRA003_100nM_VNX[rownames(lfc_values_100nM),"logFC"],"PRA006" = PRA006_100nM_VNX[rownames(lfc_values_100nM),"logFC"],"PRA011" = PRA011_100nM_VNX[rownames(lfc_values_100nM),"logFC"])
+rownames(lfc_values_100nM_1) <- rownames(lfc_values_100nM)
+lfc_values_100nM_1 <- as.matrix(lfc_values_100nM_1)
+
+heatmap.2(lfc_values_100nM_1, scale="row",
+   labRow=rownames(lfc_values_100nM_1), labCol=colnames(lfc_values_100nM_1), 
+   col=mycol, trace="none", density.info="none", dendrogram="column", srtCol=45, cexCol = 0.8, cexRow = 0.4)
+
+lfc_values_100nM_MCLi <- data.frame("ICB_2006" = ICB_2006_100nM_VNX_MCLi[topgenes2,"logFC"],"ICB_2013" = ICB_2013_100nM_VNX_MCLi[topgenes2,"logFC"],"ICB_3147" = ICB_3147_100nM_VNX_MCLi[topgenes2,"logFC"],"PRA003" = PRA003_100nM_VNX_MCLi[topgenes2,"logFC"],"PRA006" = PRA006_100nM_VNX_MCLi[topgenes2,"logFC"],"PRA011" = PRA011_100nM_VNX_MCLi[topgenes2,"logFC"])
+rownames(lfc_values_100nM_MCLi) <- topgenes2
+lfc_values_100nM_MCLi <- as.matrix(lfc_values_100nM_MCLi)
+
+heatmap.2(lfc_values_100nM_MCLi, scale="row",
+   labRow=rownames(lfc_values_100nM_MCLi), labCol=colnames(lfc_values_100nM_MCLi), 
+   col=mycol, trace="none", density.info="none", dendrogram="column", srtCol=45, cexCol = 0.8, cexRow = 0.4)
+
+```
+
+```{r}
+gi2ez <- function(x){
+  gene_id <- rownames(x)
+  genes <- ensembl[match(gene_id, ensembl$gene_id),]
+  genes <- genes[!duplicated(genes$entrez),]
+  genes <- genes[!is.na(genes$entrez),]
+  x <- x[rownames(x) %in% genes$gene_id,]
+  genes <- genes[genes$gene_id %in% rownames(x),]
+  rownames(x) <- genes$entrez
+  x
+}
+#VNX
+go_VNX_5nM <- goana(gi2ez(VNX_5nM))
+topGO(go_VNX_5nM, ont="BP", sort="Up", n=30, truncate=30)
+go_VNX_10nM <- goana(gi2ez(VNX_10nM))
+topGO(go_VNX_10nM, ont="BP", sort="Up", n=30, truncate=30)
+go_VNX_100nM <- goana(gi2ez(VNX_100nM))
+topGO(go_VNX_100nM, ont="BP", sort="Up", n=30, truncate=30)
+#MCLi
+go_MCLi <- goana(gi2ez(MCLi_10nM))
+topGO(go_MCLi, ont="BP", sort="Up", n=30, truncate=30)
+#VNX combo
+go_VNX_5nM_MCLi <- goana(gi2ez(VNX_5nM_MCLi))
+topGO(go_VNX_5nM_MCLi, ont="BP", sort="Up", n=30, truncate=30)
+go_VNX_10nM_MCLi <- goana(gi2ez(VNX_10nM_MCLi))
+topGO(go_VNX_10nM_MCLi, ont="BP", sort="Up", n=30, truncate=30)
+go_VNX_100nM_MCLi <- goana(gi2ez(VNX_100nM_MCLi))
+topGO(go_VNX_100nM_MCLi, ont="BP", sort="Up", n=30, truncate=30)
+```
+
+```{r IPA output}
+all_sig_genes <- c(rownames(sig_res_VNX_5nM),rownames(sig_res_VNX_10nM),rownames(sig_res_VNX_100nM),rownames(sig_res_MCLi_10nM),rownames(sig_res_VNX_5nM_MCLi),rownames(sig_res_VNX_10nM_MCLi),rownames(sig_res_VNX_100nM_MCLi),rownames(sig_res_PMA_PHA)[1:1000])
+all_sig_genes <- unique(unlist(strsplit(all_sig_genes, " ")))
+
+filt_VNX_5nM <- full_res_VNX_5nM[all_sig_genes,c(10,14)]
+filt_VNX_10nM <- full_res_VNX_10nM[all_sig_genes,c(10,14)]
+filt_VNX_100nM <- full_res_VNX_100nM[all_sig_genes,c(10,14)]
+filt_MCLi <- full_res_MCLi_10nM[all_sig_genes,c(10,14)]
+filt_VNX_5nM_MCLi <- full_res_VNX_5nM_MCLi[all_sig_genes,c(10,14)]
+filt_VNX_10nM_MCLi <- full_res_VNX_10nM_MCLi[all_sig_genes,c(10,14)]
+filt_VNX_100nM_MCLi <- full_res_VNX_100nM_MCLi[all_sig_genes,c(10,14)]
+filt_PMA <- full_res_PMA_PHA[all_sig_genes,c(10,14)]
+
+comb <- cbind(filt_VNX_5nM,filt_VNX_10nM,filt_VNX_100nM,filt_MCLi,filt_VNX_5nM_MCLi,filt_VNX_10nM_MCLi,filt_VNX_100nM_MCLi,filt_PMA)
+
+write.csv(comb,"VNX_IPA_combined.csv", row.names = T)
+```
+
+```{r IPA results heatmap}
+IPA_res <- read.table("/Users/sheerin.d/Library/CloudStorage/OneDrive-wehi.edu.au/2022/Marcel_HIV/Results/VMX_combos_comparison_IPA.txt", header = T, sep = "\t")[c(1:90),]
+colnames(IPA_res) <- c("Pathway","5 nM VNX","10 nM VNX","100 nM VNX","10 nM MCLi","5 nM VNX + MCLi","10 nM VNX + MCLi","100 nM VNX + MCLi")
+IPA_melt <- reshape2::melt(IPA_res, id.vars = "Pathway")
+IPA_melt$value <- as.numeric(IPA_melt$value)
+IPA_melt$value_100nM_VNX <- c(rep(IPA_melt[grep("100 nM VNX",IPA_melt$variable),]$value[c(1:90)],7))
+IPA_melt_sub <- IPA_melt[abs(IPA_melt$value_100nM_VNX)>2,]
+IPA_melt_sub$Pathway <- rep(c("Phagosome formation","DC and NK cell crosstalk","Neuroinflammation","Wound healing","NO/ROS production","iNOS signaling","Necroptosis","IL-8 signaling","HMGB1 signaling","Role of IL-17F","Inhibition of ARE degradation","IL-17 signaling","PKR in IFN inducation\n and antiviral response","TREM1 signaling","Pulmonary fibrosis\n idiopathic signaling pathway","MIF innate immune regulation","IL-6 signaling","IL-15 production","p38 MAPK signaling","IL-17A/F regulation","Inflammasome","Th1 pathway","Pulmonary healing","MIF-mediated\n glucocorticoid regulation","Fcγ Receptor-\n mediated Phagocytosis","T cell IL-17A/F production","LPS-mediated MAPK signaling","Aryl hydrocarbon\n receptor signaling","14-3-3-mediated signaling","Lymphotoxin β\n receptor signaling","IL-13 signaling","HIF1α signaling","EIF2 signaling","Antioxidant action"),7)
+ggplot(IPA_melt_sub, aes(reorder(Pathway,rev(value_100nM_VNX)), variable)) +
+  geom_tile(aes(fill = value), colour = "white") +
+  scale_fill_gradient2(low = "blue", mid = "white", high = "red") +
+  theme_minimal() +
+  coord_fixed() +
+  ylab("Comparison") +
+  xlab("Genes in pathway") +
+  ggtitle("Venetoxclax-induced pathway comparison") +
+  labs(fill = "Z-score") +
+  theme(plot.title = element_text(color="black", size=14, face="bold"), axis.text.x = element_text(size = 10, color = "black", angle = 45, hjust = 1, vjust = 1), axis.title.y = element_text(size = 14, face = "bold"), axis.text.y = element_text(size = 12, color = "black", face = "bold"), axis.title.x = element_text(size = 14, face = "bold"), legend.text = element_text(size = 10), legend.title = element_text(face = "bold", size = 14), legend.position = "bottom")
+```
+
